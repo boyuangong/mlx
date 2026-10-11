@@ -39,8 +39,11 @@ struct AttnParams {
   int64_t O_strides[3];
 };
 
+// The launch bounds match the block sizes used by the launchers below. At
+// D = 512 the 1024-thread kernels sit at the 64 registers per thread such a
+// block allows, so let the compiler spill rather than fail to launch.
 template <typename T, bool do_causal, int Dk, int Dv>
-__global__ void kernel_sdpav_1pass(
+__global__ void __launch_bounds__(1024) kernel_sdpav_1pass(
     const T* Q,
     const T* K,
     const T* V,
@@ -189,7 +192,7 @@ __global__ void kernel_sdpav_1pass(
 }
 
 template <typename T, bool do_causal, int Dk, int Dv>
-__global__ void kernel_sdpav_2pass_1(
+__global__ void __launch_bounds__(256) kernel_sdpav_2pass_1(
     const T* Q,
     const T* K,
     const T* V,
@@ -364,7 +367,7 @@ __global__ void kernel_sdpav_2pass_1(
 }
 
 template <typename T, bool do_causal, int Dv>
-__global__ void kernel_sdpav_2pass_2(
+__global__ void __launch_bounds__(1024) kernel_sdpav_2pass_2(
     const float* partials,
     const float* sums,
     const float* maxs,
@@ -448,6 +451,10 @@ constexpr std::pair<int, int> vector_head_dims[] = {
     {64, 64},
     {96, 96},
     {128, 128},
+    {256, 256},
+    {512, 512},
+    {96, 64},
+    {192, 128},
 };
 
 constexpr bool is_supported_vector_head_dims(int dk, int dv) {
@@ -469,6 +476,10 @@ void dispatch_headdims(int dk, int dv, F&& f) {
   MLX_SDPAV_CASE(64, 64)
   MLX_SDPAV_CASE(96, 96)
   MLX_SDPAV_CASE(128, 128)
+  MLX_SDPAV_CASE(256, 256)
+  MLX_SDPAV_CASE(512, 512)
+  MLX_SDPAV_CASE(96, 64)
+  MLX_SDPAV_CASE(192, 128)
 #undef MLX_SDPAV_CASE
   throw std::invalid_argument(
       fmt::format("[sdpa_vector] Unsupported head dims ({}, {}).", dk, dv));
