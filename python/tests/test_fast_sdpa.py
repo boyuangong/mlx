@@ -1451,6 +1451,20 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
                     )
                     self.assertTrue(mx.allclose(ref, out, atol=2e-3, rtol=2e-3))
 
+            # Rows that are not aligned for vector loads: an odd row stride
+            # and a base pointer one element into the buffer.
+            for kL in (100, 2000):
+                with self.subTest(Dk=Dk, Dv=Dv, layout="unaligned", kL=kL):
+                    k_full = mx.random.normal((1, 2, kL, Dk + 1))
+                    v_full = mx.random.normal((1, 2, kL, Dv + 1))
+                    k = k_full.astype(mx.float16)[..., 1:]
+                    v = v_full.astype(mx.float16)[..., 1:]
+                    ref = mlx_ref_attn(q, k, v, scale=scale)
+                    out = mx.fast.scaled_dot_product_attention(
+                        q, k, v, scale=scale, force_fused=True
+                    )
+                    self.assertTrue(mx.allclose(ref, out, atol=2e-3, rtol=2e-3))
+
             # Sequence-major storage with the head and sequence axes swapped.
             for kL in (43, 4096):
                 with self.subTest(Dk=Dk, Dv=Dv, layout="transposed", kL=kL):

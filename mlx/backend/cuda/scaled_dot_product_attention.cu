@@ -22,6 +22,38 @@ namespace cg = cooperative_groups;
 
 #define PRAGMA_LOOP_UNROLL #pragma unroll
 
+// Whether rows starting at ptr and spaced row_stride elements apart can be
+// read N elements per lane with a single vector load.
+template <int N, typename T>
+__device__ __forceinline__ bool vector_rows(const T* ptr, int64_t row_stride) {
+  if constexpr ((N & (N - 1)) == 0) {
+    return is_aligned<N>(ptr) && row_stride % N == 0;
+  } else {
+    return false;
+  }
+}
+
+// Calls f(i, ptr[N * lane + i]) for i in [0, N), with one vector load when
+// vector_rows() allowed it.
+template <int N, typename T, typename F>
+__device__ __forceinline__ void
+for_each_lane_value(const T* ptr, int lane, bool vectorized, F&& f) {
+  if constexpr ((N & (N - 1)) == 0) {
+    if (vectorized) {
+      auto v = unsafe_load_vector<N>(ptr, lane);
+      PRAGMA_LOOP_UNROLL
+      for (int i = 0; i < N; i++) {
+        f(i, v[i]);
+      }
+      return;
+    }
+  }
+  PRAGMA_LOOP_UNROLL
+  for (int i = 0; i < N; i++) {
+    f(i, ptr[N * lane + i]);
+  }
+}
+
 struct AttnParams {
   int B;
   int H;
@@ -119,6 +151,9 @@ __global__ void __launch_bounds__(1024) kernel_sdpav_1pass(
     sum_exp_score = 1.f;
   }
 
+  const bool k_vec = vector_rows<qk_per_thread>(K, params.K_strides[2]);
+  const bool v_vec = vector_rows<v_per_thread>(V, params.V_strides[2]);
+
   // For each key
   for (int i = kv_seq_idx; i < params.kL; i += BN) {
     bool use_key = true;
@@ -130,10 +165,9 @@ __global__ void __launch_bounds__(1024) kernel_sdpav_1pass(
       // Compute the i-th score, reading the key straight into the dot
       // product so it does not occupy registers for large head dims.
       U score = 0.f;
-      PRAGMA_LOOP_UNROLL
-      for (int j = 0; j < qk_per_thread; j++) {
-        score += q[j] * static_cast<U>(K[qk_per_thread * lane_idx + j]);
-      }
+      for_each_lane_value<qk_per_thread>(K, lane_idx, k_vec, [&](int j, T x) {
+        score += q[j] * static_cast<U>(x);
+      });
 
       // Warp sum
       score = cg::reduce(warp, score, cg::plus<U>());
@@ -147,11 +181,9 @@ __global__ void __launch_bounds__(1024) kernel_sdpav_1pass(
       sum_exp_score = sum_exp_score * factor + exp_score;
 
       // Update the output accumulator
-      PRAGMA_LOOP_UNROLL
-      for (int j = 0; j < v_per_thread; j++) {
-        o[j] = o[j] * factor +
-            exp_score * static_cast<U>(V[v_per_thread * lane_idx + j]);
-      }
+      for_each_lane_value<v_per_thread>(V, lane_idx, v_vec, [&](int j, T x) {
+        o[j] = o[j] * factor + exp_score * static_cast<U>(x);
+      });
     }
 
     // Move the pointers to the next kv
@@ -280,6 +312,9 @@ __global__ void __launch_bounds__(256) kernel_sdpav_2pass_1(
     sum_exp_score = 1.f;
   }
 
+  const bool k_vec = vector_rows<qk_per_thread>(K, params.K_strides[2]);
+  const bool v_vec = vector_rows<v_per_thread>(V, params.V_strides[2]);
+
   // For each key
   for (int i = kv_seq_idx; i < params.kL; i += blocks * BN) {
     bool use_key = true;
@@ -291,10 +326,9 @@ __global__ void __launch_bounds__(256) kernel_sdpav_2pass_1(
       // Compute the i-th score, reading the key straight into the dot
       // product so it does not occupy registers for large head dims.
       U score = 0.f;
-      PRAGMA_LOOP_UNROLL
-      for (int j = 0; j < qk_per_thread; j++) {
-        score += q[j] * static_cast<U>(K[qk_per_thread * lane_idx + j]);
-      }
+      for_each_lane_value<qk_per_thread>(K, lane_idx, k_vec, [&](int j, T x) {
+        score += q[j] * static_cast<U>(x);
+      });
 
       // Warp sum
       score = cg::reduce(warp, score, cg::plus<U>());
@@ -308,11 +342,9 @@ __global__ void __launch_bounds__(256) kernel_sdpav_2pass_1(
       sum_exp_score = sum_exp_score * factor + exp_score;
 
       // Update the output accumulator
-      PRAGMA_LOOP_UNROLL
-      for (int j = 0; j < v_per_thread; j++) {
-        o[j] = o[j] * factor +
-            exp_score * static_cast<U>(V[v_per_thread * lane_idx + j]);
-      }
+      for_each_lane_value<v_per_thread>(V, lane_idx, v_vec, [&](int j, T x) {
+        o[j] = o[j] * factor + exp_score * static_cast<U>(x);
+      });
     }
 
     // Move the pointers to the next kv
