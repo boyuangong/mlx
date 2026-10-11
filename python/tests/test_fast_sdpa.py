@@ -1350,7 +1350,7 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
             return q, k, v
 
         # Vector attention kernel.
-        for D in (64, 96, 128):
+        for D in (64, 96, 128, 256, 512):
             with self.subTest(head_dim=D):
                 q, k, v = make_qkv(3, 128, D, 4, 2)
                 scale = D**-0.5
@@ -1359,6 +1359,172 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
                     q, k, v, scale=scale, force_fused=True
                 )
                 self.assertTrue(mx.allclose(ref, out, atol=1e-3, rtol=1e-3))
+
+    @unittest.skipIf(not mx.cuda.is_available(), "CUDA kernel path only")
+    def test_sdpa_vector_head_dims_cuda(self):
+        if mx.default_device() != mx.gpu:
+            self.skipTest("requires GPU")
+
+        tolerances = {mx.float32: 1e-4, mx.float16: 2e-3, mx.bfloat16: 1e-2}
+
+        def check(Dk, Dv, qL, kL, qH, kH, causal, use_sinks, dtype):
+            q = mx.random.normal((1, qH, qL, Dk)).astype(dtype)
+            k = mx.random.normal((1, kH, kL, Dk)).astype(dtype)
+            v = mx.random.normal((1, kH, kL, Dv)).astype(dtype)
+            sinks = mx.random.normal((qH,)).astype(dtype) if use_sinks else None
+            mask = "causal" if causal else None
+            scale = Dk**-0.5
+            # Reference in float32 so it does not add its own rounding error.
+            ref = mlx_ref_attn(
+                q.astype(mx.float32),
+                k.astype(mx.float32),
+                v.astype(mx.float32),
+                scale=scale,
+                mask=mask,
+                sinks=None if sinks is None else sinks.astype(mx.float32),
+            )
+            out = mx.fast.scaled_dot_product_attention(
+                q, k, v, scale=scale, mask=mask, sinks=sinks, force_fused=True
+            )
+            self.assertEqual(out.shape, (1, qH, qL, Dv))
+            tol = tolerances[dtype]
+            self.assertTrue(
+                mx.allclose(ref, out.astype(mx.float32), atol=tol, rtol=tol)
+            )
+
+        mx.random.seed(0)
+        # Large head dims get the full matrix; kL covers a single key, fewer
+        # keys than warps, the last 1-pass length, the first 2-pass length
+        # and a long 2-pass case.
+        for Dk, Dv in ((256, 256), (512, 512), (192, 128)):
+            for qL, kL, (qH, kH), causal, use_sinks in product(
+                (1, 3),
+                (1, 31, 1024, 1025, 4096),
+                ((8, 8), (8, 2), (16, 1)),
+                (False, True),
+                (False, True),
+            ):
+                if qL > kL:
+                    continue
+                for dtype in (mx.float16, mx.bfloat16, mx.float32):
+                    if kL == 4096 and dtype != mx.float16:
+                        continue
+                    with self.subTest(
+                        Dk=Dk,
+                        Dv=Dv,
+                        qL=qL,
+                        kL=kL,
+                        heads=(qH, kH),
+                        causal=causal,
+                        sinks=use_sinks,
+                        dtype=dtype,
+                    ):
+                        check(Dk, Dv, qL, kL, qH, kH, causal, use_sinks, dtype)
+
+        # Smoke test the remaining pairs in every dtype.
+        for Dk, Dv in ((64, 64), (96, 96), (128, 128), (96, 64)):
+            for dtype in (mx.float16, mx.bfloat16, mx.float32):
+                for kL in (128, 2048):
+                    with self.subTest(Dk=Dk, Dv=Dv, kL=kL, dtype=dtype):
+                        check(Dk, Dv, 1, kL, 8, 2, False, False, dtype)
+
+    @unittest.skipIf(not mx.cuda.is_available(), "CUDA kernel path only")
+    def test_sdpa_vector_kv_layouts_cuda(self):
+        if mx.default_device() != mx.gpu:
+            self.skipTest("requires GPU")
+        mx.random.seed(0)
+        for Dk, Dv in ((256, 256), (512, 512), (192, 128)):
+            scale = Dk**-0.5
+            q = mx.random.normal((1, 8, 1, Dk)).astype(mx.float16)
+
+            # Keys and values sliced from a larger preallocated cache, the
+            # way mlx-lm hands them over.
+            k_buf = mx.random.normal((1, 2, 4096, Dk)).astype(mx.float16)
+            v_buf = mx.random.normal((1, 2, 4096, Dv)).astype(mx.float16)
+            for kL in (1000, 3000):
+                with self.subTest(Dk=Dk, Dv=Dv, layout="sliced", kL=kL):
+                    k = k_buf[:, :, :kL, :]
+                    v = v_buf[:, :, :kL, :]
+                    ref = mlx_ref_attn(q, k, v, scale=scale)
+                    out = mx.fast.scaled_dot_product_attention(
+                        q, k, v, scale=scale, force_fused=True
+                    )
+                    self.assertTrue(mx.allclose(ref, out, atol=2e-3, rtol=2e-3))
+
+            # Rows that are not aligned for vector loads: an odd row stride
+            # and a base pointer one element into the buffer.
+            for kL in (100, 2000):
+                with self.subTest(Dk=Dk, Dv=Dv, layout="unaligned", kL=kL):
+                    k_full = mx.random.normal((1, 2, kL, Dk + 1))
+                    v_full = mx.random.normal((1, 2, kL, Dv + 1))
+                    k = k_full.astype(mx.float16)[..., 1:]
+                    v = v_full.astype(mx.float16)[..., 1:]
+                    ref = mlx_ref_attn(q, k, v, scale=scale)
+                    out = mx.fast.scaled_dot_product_attention(
+                        q, k, v, scale=scale, force_fused=True
+                    )
+                    self.assertTrue(mx.allclose(ref, out, atol=2e-3, rtol=2e-3))
+
+            # Sequence-major storage with the head and sequence axes swapped.
+            for kL in (43, 4096):
+                with self.subTest(Dk=Dk, Dv=Dv, layout="transposed", kL=kL):
+                    k = mx.random.normal((1, kL, 2, Dk)).astype(mx.float16)
+                    v = mx.random.normal((1, kL, 2, Dv)).astype(mx.float16)
+                    k = k.swapaxes(1, 2)
+                    v = v.swapaxes(1, 2)
+                    ref = mlx_ref_attn(q, k, v, scale=scale)
+                    out = mx.fast.scaled_dot_product_attention(
+                        q, k, v, scale=scale, force_fused=True
+                    )
+                    self.assertTrue(mx.allclose(ref, out, atol=2e-3, rtol=2e-3))
+
+        # DeepSeek-V2 MLA layout: keys are [k_nope (128) | k_pe (64)] with the
+        # rotary part shared across heads, values are 128 wide.
+        H, kL = 16, 2048
+        q = mx.random.normal((1, H, 1, 192)).astype(mx.bfloat16)
+        k_nope = mx.random.normal((1, H, kL, 128)).astype(mx.bfloat16)
+        k_pe = mx.random.normal((1, 1, kL, 64)).astype(mx.bfloat16)
+        k = mx.concatenate([k_nope, mx.repeat(k_pe, H, axis=1)], axis=-1)
+        v = mx.random.normal((1, H, kL, 128)).astype(mx.bfloat16)
+        scale = 192**-0.5
+        ref = mlx_ref_attn(
+            q.astype(mx.float32), k.astype(mx.float32), v.astype(mx.float32), scale
+        )
+        out = mx.fast.scaled_dot_product_attention(
+            q, k, v, scale=scale, mask="causal", force_fused=True
+        )
+        self.assertTrue(mx.allclose(ref, out.astype(mx.float32), atol=1e-2, rtol=1e-2))
+
+    @unittest.skipIf(not mx.cuda.is_available(), "CUDA kernel path only")
+    def test_sdpa_vector_unsupported_head_dims_cuda(self):
+        if mx.default_device() != mx.gpu:
+            self.skipTest("requires GPU")
+        mx.random.seed(0)
+        for Dq, Dk, Dv in (
+            (80, 80, 80),
+            (72, 72, 72),
+            (128, 128, 64),
+            (256, 256, 128),
+            (256, 128, 256),
+        ):
+            with self.subTest(Dq=Dq, Dk=Dk, Dv=Dv):
+                q = mx.random.normal((1, 8, 1, Dq)).astype(mx.float16)
+                # kL < 256 keeps the cuDNN decode path (fixed-size kv-cache
+                # slices, kL >= 256) out of the picture on sm80+.
+                k = mx.random.normal((1, 2, 200, Dk)).astype(mx.float16)
+                v = mx.random.normal((1, 2, 200, Dv)).astype(mx.float16)
+                scale = Dq**-0.5
+                if Dq == Dk:
+                    # The unfused fallback stays correct.
+                    ref = mlx_ref_attn(q, k, v, scale=scale)
+                    out = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale)
+                    self.assertTrue(mx.allclose(ref, out, atol=2e-3, rtol=2e-3))
+                with self.assertRaises(ValueError):
+                    mx.eval(
+                        mx.fast.scaled_dot_product_attention(
+                            q, k, v, scale=scale, force_fused=True
+                        )
+                    )
 
     def test_sdpa_sliced(self):
         N = 8

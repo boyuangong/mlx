@@ -12,6 +12,7 @@
 
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
+#include <fmt/format.h>
 
 namespace mlx::core {
 
@@ -20,6 +21,38 @@ namespace cu {
 namespace cg = cooperative_groups;
 
 #define PRAGMA_LOOP_UNROLL #pragma unroll
+
+// Whether rows starting at ptr and spaced row_stride elements apart can be
+// read N elements per lane with a single vector load.
+template <int N, typename T>
+__device__ __forceinline__ bool vector_rows(const T* ptr, int64_t row_stride) {
+  if constexpr ((N & (N - 1)) == 0) {
+    return is_aligned<N>(ptr) && row_stride % N == 0;
+  } else {
+    return false;
+  }
+}
+
+// Calls f(i, ptr[N * lane + i]) for i in [0, N), with one vector load when
+// vector_rows() allowed it.
+template <int N, typename T, typename F>
+__device__ __forceinline__ void
+for_each_lane_value(const T* ptr, int lane, bool vectorized, F&& f) {
+  if constexpr ((N & (N - 1)) == 0) {
+    if (vectorized) {
+      auto v = unsafe_load_vector<N>(ptr, lane);
+      PRAGMA_LOOP_UNROLL
+      for (int i = 0; i < N; i++) {
+        f(i, v[i]);
+      }
+      return;
+    }
+  }
+  PRAGMA_LOOP_UNROLL
+  for (int i = 0; i < N; i++) {
+    f(i, ptr[N * lane + i]);
+  }
+}
 
 struct AttnParams {
   int B;
@@ -38,8 +71,11 @@ struct AttnParams {
   int64_t O_strides[3];
 };
 
-template <typename T, bool do_causal, int D>
-__global__ void kernel_sdpav_1pass(
+// The launch bounds match the block sizes used by the launchers below. At
+// D = 512 the 1024-thread kernels sit at the 64 registers per thread such a
+// block allows, so let the compiler spill rather than fail to launch.
+template <typename T, bool do_causal, int Dk, int Dv>
+__global__ void __launch_bounds__(1024) kernel_sdpav_1pass(
     const T* Q,
     const T* K,
     const T* V,
@@ -49,15 +85,16 @@ __global__ void kernel_sdpav_1pass(
   constexpr int BN = 32;
   constexpr int BD = 32;
 
-  constexpr int v_per_thread = D / BD;
+  static_assert(Dk % BD == 0 && Dv % BD == 0);
+  constexpr int qk_per_thread = Dk / BD;
+  constexpr int v_per_thread = Dv / BD;
 
   const int inner_k_stride = BN * int(params.K_strides[2]);
   const int inner_v_stride = BN * int(params.V_strides[2]);
 
   typedef float U;
 
-  U q[v_per_thread];
-  U k[v_per_thread];
+  U q[qk_per_thread];
   U o[v_per_thread];
 
   __shared__ U outputs[BN][BD + 1];
@@ -98,8 +135,8 @@ __global__ void kernel_sdpav_1pass(
 
   // Read the query and 0 the output accumulator
   PRAGMA_LOOP_UNROLL
-  for (int i = 0; i < v_per_thread; i++) {
-    q[i] = scale_log2 * static_cast<U>(Q[v_per_thread * lane_idx + i]);
+  for (int i = 0; i < qk_per_thread; i++) {
+    q[i] = scale_log2 * static_cast<U>(Q[qk_per_thread * lane_idx + i]);
   }
 
   PRAGMA_LOOP_UNROLL
@@ -114,6 +151,9 @@ __global__ void kernel_sdpav_1pass(
     sum_exp_score = 1.f;
   }
 
+  const bool k_vec = vector_rows<qk_per_thread>(K, params.K_strides[2]);
+  const bool v_vec = vector_rows<v_per_thread>(V, params.V_strides[2]);
+
   // For each key
   for (int i = kv_seq_idx; i < params.kL; i += BN) {
     bool use_key = true;
@@ -122,18 +162,12 @@ __global__ void kernel_sdpav_1pass(
     }
 
     if (use_key) {
-      // Read the key
-      PRAGMA_LOOP_UNROLL
-      for (int j = 0; j < v_per_thread; j++) {
-        k[j] = K[v_per_thread * lane_idx + j];
-      }
-
-      // Compute the i-th score
+      // Compute the i-th score, reading the key straight into the dot
+      // product so it does not occupy registers for large head dims.
       U score = 0.f;
-      PRAGMA_LOOP_UNROLL
-      for (int j = 0; j < v_per_thread; j++) {
-        score += q[j] * k[j];
-      }
+      for_each_lane_value<qk_per_thread>(K, lane_idx, k_vec, [&](int j, T x) {
+        score += q[j] * static_cast<U>(x);
+      });
 
       // Warp sum
       score = cg::reduce(warp, score, cg::plus<U>());
@@ -147,11 +181,9 @@ __global__ void kernel_sdpav_1pass(
       sum_exp_score = sum_exp_score * factor + exp_score;
 
       // Update the output accumulator
-      PRAGMA_LOOP_UNROLL
-      for (int j = 0; j < v_per_thread; j++) {
-        o[j] = o[j] * factor +
-            exp_score * static_cast<U>(V[v_per_thread * lane_idx + j]);
-      }
+      for_each_lane_value<v_per_thread>(V, lane_idx, v_vec, [&](int j, T x) {
+        o[j] = o[j] * factor + exp_score * static_cast<U>(x);
+      });
     }
 
     // Move the pointers to the next kv
@@ -191,8 +223,8 @@ __global__ void kernel_sdpav_1pass(
   }
 }
 
-template <typename T, bool do_causal, int D>
-__global__ void kernel_sdpav_2pass_1(
+template <typename T, bool do_causal, int Dk, int Dv>
+__global__ void __launch_bounds__(256) kernel_sdpav_2pass_1(
     const T* Q,
     const T* K,
     const T* V,
@@ -205,15 +237,16 @@ __global__ void kernel_sdpav_2pass_1(
   constexpr int BD = 32;
   constexpr int blocks = 32;
 
-  constexpr int v_per_thread = D / BD;
+  static_assert(Dk % BD == 0 && Dv % BD == 0);
+  constexpr int qk_per_thread = Dk / BD;
+  constexpr int v_per_thread = Dv / BD;
 
   const int inner_k_stride = blocks * BN * int(params.K_strides[2]);
   const int inner_v_stride = blocks * BN * int(params.V_strides[2]);
 
   typedef float U;
 
-  U q[v_per_thread];
-  U k[v_per_thread];
+  U q[qk_per_thread];
   U o[v_per_thread];
 
   __shared__ U outputs[BN][BD + 1];
@@ -257,14 +290,14 @@ __global__ void kernel_sdpav_2pass_1(
       q_seq_idx * p_stride_s + // Sequence
       block_idx; // Block
 
-  partials += p_offset * D;
+  partials += p_offset * Dv;
   sums += p_offset;
   maxs += p_offset;
 
   // Read the query and 0 the output accumulator
   PRAGMA_LOOP_UNROLL
-  for (int i = 0; i < v_per_thread; i++) {
-    q[i] = scale_log2 * static_cast<U>(Q[v_per_thread * lane_idx + i]);
+  for (int i = 0; i < qk_per_thread; i++) {
+    q[i] = scale_log2 * static_cast<U>(Q[qk_per_thread * lane_idx + i]);
   }
 
   PRAGMA_LOOP_UNROLL
@@ -279,6 +312,9 @@ __global__ void kernel_sdpav_2pass_1(
     sum_exp_score = 1.f;
   }
 
+  const bool k_vec = vector_rows<qk_per_thread>(K, params.K_strides[2]);
+  const bool v_vec = vector_rows<v_per_thread>(V, params.V_strides[2]);
+
   // For each key
   for (int i = kv_seq_idx; i < params.kL; i += blocks * BN) {
     bool use_key = true;
@@ -287,18 +323,12 @@ __global__ void kernel_sdpav_2pass_1(
     }
 
     if (use_key) {
-      // Read the key
-      PRAGMA_LOOP_UNROLL
-      for (int j = 0; j < v_per_thread; j++) {
-        k[j] = K[v_per_thread * lane_idx + j];
-      }
-
-      // Compute the i-th score
+      // Compute the i-th score, reading the key straight into the dot
+      // product so it does not occupy registers for large head dims.
       U score = 0.f;
-      PRAGMA_LOOP_UNROLL
-      for (int j = 0; j < v_per_thread; j++) {
-        score += q[j] * k[j];
-      }
+      for_each_lane_value<qk_per_thread>(K, lane_idx, k_vec, [&](int j, T x) {
+        score += q[j] * static_cast<U>(x);
+      });
 
       // Warp sum
       score = cg::reduce(warp, score, cg::plus<U>());
@@ -312,11 +342,9 @@ __global__ void kernel_sdpav_2pass_1(
       sum_exp_score = sum_exp_score * factor + exp_score;
 
       // Update the output accumulator
-      PRAGMA_LOOP_UNROLL
-      for (int j = 0; j < v_per_thread; j++) {
-        o[j] = o[j] * factor +
-            exp_score * static_cast<U>(V[v_per_thread * lane_idx + j]);
-      }
+      for_each_lane_value<v_per_thread>(V, lane_idx, v_vec, [&](int j, T x) {
+        o[j] = o[j] * factor + exp_score * static_cast<U>(x);
+      });
     }
 
     // Move the pointers to the next kv
@@ -370,8 +398,8 @@ __global__ void kernel_sdpav_2pass_1(
   }
 }
 
-template <typename T, bool do_causal, int D>
-__global__ void kernel_sdpav_2pass_2(
+template <typename T, bool do_causal, int Dv>
+__global__ void __launch_bounds__(1024) kernel_sdpav_2pass_2(
     const float* partials,
     const float* sums,
     const float* maxs,
@@ -381,7 +409,8 @@ __global__ void kernel_sdpav_2pass_2(
   constexpr int BD = 32;
   constexpr int blocks = 32;
 
-  constexpr int v_per_thread = D / BD;
+  static_assert(Dv % BD == 0);
+  constexpr int v_per_thread = Dv / BD;
 
   typedef float U;
 
@@ -406,7 +435,7 @@ __global__ void kernel_sdpav_2pass_2(
       head_idx * p_stride_h + // Head
       q_seq_idx * p_stride_s; // Sequence
 
-  partials += p_offset * D + warp_idx * D;
+  partials += p_offset * Dv + warp_idx * Dv;
   sums += p_offset;
   maxs += p_offset;
 
@@ -448,19 +477,44 @@ __global__ void kernel_sdpav_2pass_2(
 
 namespace {
 
-template <typename F>
-void dispatch_headdim(int n, F&& f) {
-  switch (n) {
-    case 64:
-      f(std::integral_constant<int, 64>{});
-      break;
-    case 96:
-      f(std::integral_constant<int, 96>{});
-      break;
-    case 128:
-      f(std::integral_constant<int, 128>{});
-      break;
+// (D_qk, D_v) pairs compiled for the vector kernels. Keep in sync with the
+// cases in dispatch_headdims().
+constexpr std::pair<int, int> vector_head_dims[] = {
+    {64, 64},
+    {96, 96},
+    {128, 128},
+    {256, 256},
+    {512, 512},
+    {96, 64},
+    {192, 128},
+};
+
+constexpr bool is_supported_vector_head_dims(int dk, int dv) {
+  for (auto [k, v] : vector_head_dims) {
+    if (k == dk && v == dv) {
+      return true;
+    }
   }
+  return false;
+}
+
+template <typename F>
+void dispatch_headdims(int dk, int dv, F&& f) {
+#define MLX_SDPAV_CASE(DK, DV)                                               \
+  if (dk == DK && dv == DV) {                                                \
+    f(std::integral_constant<int, DK>{}, std::integral_constant<int, DV>{}); \
+    return;                                                                  \
+  }
+  MLX_SDPAV_CASE(64, 64)
+  MLX_SDPAV_CASE(96, 96)
+  MLX_SDPAV_CASE(128, 128)
+  MLX_SDPAV_CASE(256, 256)
+  MLX_SDPAV_CASE(512, 512)
+  MLX_SDPAV_CASE(96, 64)
+  MLX_SDPAV_CASE(192, 128)
+#undef MLX_SDPAV_CASE
+  throw std::invalid_argument(
+      fmt::format("[sdpa_vector] Unsupported head dims ({}, {}).", dk, dv));
 }
 
 void sdpa_vector_1pass_fallback(
@@ -502,11 +556,11 @@ void sdpa_vector_1pass_fallback(
 
   dispatch_float_types(o.dtype(), "kernel_sdpav_1pass", [&](auto type_tag) {
     dispatch_bool(do_causal, [&](auto do_causal) {
-      dispatch_headdim(params.D, [&](auto headdim) {
+      dispatch_headdims(q.shape(3), v.shape(3), [&](auto dk, auto dv) {
         using DataType = cuda_type_t<MLX_GET_TYPE(type_tag)>;
 
-        auto kernel =
-            cu::kernel_sdpav_1pass<DataType, do_causal.value, headdim.value>;
+        auto kernel = cu::
+            kernel_sdpav_1pass<DataType, do_causal.value, dk.value, dv.value>;
         encoder.add_kernel_node(
             kernel,
             grid_dim,
@@ -573,12 +627,15 @@ void sdpa_vector_2pass_fallback(
 
   dispatch_float_types(o.dtype(), "kernel_sdpav_2pass", [&](auto type_tag) {
     dispatch_bool(do_causal, [&](auto do_causal) {
-      dispatch_headdim(params.D, [&](auto headdim) {
+      dispatch_headdims(q.shape(3), v.shape(3), [&](auto dk, auto dv) {
         using DataType = cuda_type_t<MLX_GET_TYPE(type_tag)>;
 
         {
-          auto kernel = cu::
-              kernel_sdpav_2pass_1<DataType, do_causal.value, headdim.value>;
+          auto kernel = cu::kernel_sdpav_2pass_1<
+              DataType,
+              do_causal.value,
+              dk.value,
+              dv.value>;
 
           encoder.set_input_array(q);
           encoder.set_input_array(k);
@@ -609,8 +666,8 @@ void sdpa_vector_2pass_fallback(
         }
 
         {
-          auto kernel = cu::
-              kernel_sdpav_2pass_2<DataType, do_causal.value, headdim.value>;
+          auto kernel =
+              cu::kernel_sdpav_2pass_2<DataType, do_causal.value, dv.value>;
 
           encoder.set_input_array(intermediate);
           encoder.set_input_array(sums);
@@ -671,10 +728,9 @@ bool supports_sdpa_vector(
   const int value_head_dim = v.shape(-1);
   const int query_head_dim = q.shape(-1);
   const int query_sequence_length = q.shape(2);
-  const int key_sequence_length = k.shape(2);
 
-  const bool sdpa_supported_head_dim = query_head_dim == value_head_dim &&
-      (query_head_dim == 64 || query_head_dim == 96 || query_head_dim == 128);
+  const bool sdpa_supported_head_dim = query_head_dim == k.shape(-1) &&
+      is_supported_vector_head_dims(query_head_dim, value_head_dim);
 
   const bool supported_vector_config =
       sdpa_supported_head_dim && query_sequence_length < 4;
