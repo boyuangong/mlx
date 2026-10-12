@@ -14,6 +14,8 @@
 #include <cooperative_groups/reduce.h>
 #include <fmt/format.h>
 
+#include <algorithm>
+
 namespace mlx::core {
 
 namespace cu {
@@ -223,7 +225,11 @@ __global__ void __launch_bounds__(1024) kernel_sdpav_1pass(
   }
 }
 
-template <typename T, bool do_causal, int Dk, int Dv>
+// `fixed_blocks` instantiates the kernels for exactly 32 key blocks, the
+// common case. With the block count known at compile time the first pass
+// needs fewer registers, which on sm_86/89 is one more resident thread block
+// per SM for head dim 256.
+template <typename T, bool do_causal, int Dk, int Dv, bool fixed_blocks>
 __global__ void __launch_bounds__(256) kernel_sdpav_2pass_1(
     const T* Q,
     const T* K,
@@ -235,7 +241,9 @@ __global__ void __launch_bounds__(256) kernel_sdpav_2pass_1(
     __grid_constant__ const AttnParams params) {
   constexpr int BN = 8;
   constexpr int BD = 32;
-  constexpr int blocks = 32;
+  // The keys are split into `blocks` interleaved chunks of BN rows, one
+  // thread block each along z for every batch element.
+  const int blocks = fixed_blocks ? 32 : gridDim.z / params.B;
 
   static_assert(Dk % BD == 0 && Dv % BD == 0);
   constexpr int qk_per_thread = Dk / BD;
@@ -398,16 +406,17 @@ __global__ void __launch_bounds__(256) kernel_sdpav_2pass_1(
   }
 }
 
-template <typename T, bool do_causal, int Dv>
+template <typename T, bool do_causal, int Dv, bool fixed_blocks>
 __global__ void __launch_bounds__(1024) kernel_sdpav_2pass_2(
     const float* partials,
     const float* sums,
     const float* maxs,
     T* O,
-    __grid_constant__ const AttnParams params) {
+    __grid_constant__ const AttnParams params,
+    const int num_blocks) {
   constexpr int BN = 32;
   constexpr int BD = 32;
-  constexpr int blocks = 32;
+  const int blocks = fixed_blocks ? 32 : num_blocks;
 
   static_assert(Dv % BD == 0);
   constexpr int v_per_thread = Dv / BD;
@@ -435,7 +444,7 @@ __global__ void __launch_bounds__(1024) kernel_sdpav_2pass_2(
       head_idx * p_stride_h + // Head
       q_seq_idx * p_stride_s; // Sequence
 
-  partials += p_offset * Dv + warp_idx * Dv;
+  partials += p_offset * Dv;
   sums += p_offset;
   maxs += p_offset;
 
@@ -443,15 +452,46 @@ __global__ void __launch_bounds__(1024) kernel_sdpav_2pass_2(
       head_idx * params.O_strides[1] + // Head
       q_seq_idx * params.O_strides[2]; // Sequence
 
-  U max_score = maxs[lane_idx];
-  U new_max = cg::reduce(warp, max_score, cg::greater<U>());
-  U factor = exp2f(max_score - new_max);
-  U sum_exp_score = cg::reduce(warp, sums[lane_idx] * factor, cg::plus<U>());
-  sum_exp_score = sum_exp_score == 0 ? 0 : __frcp_rn(sum_exp_score);
-
+  // Each warp merges the partial outputs of blocks warp, warp + 32, ... and
+  // each lane the sums of blocks lane, lane + 32, ..., both rescaled to a
+  // running max. The two loops are independent so their loads overlap.
+  U o_max = Limits<U>::finite_min();
   PRAGMA_LOOP_UNROLL
   for (int i = 0; i < v_per_thread; i++) {
-    o[i] = partials[v_per_thread * lane_idx + i];
+    o[i] = 0.f;
+  }
+  for (int b = warp_idx; b < blocks; b += BN) {
+    U m = maxs[b];
+    U new_max = max(o_max, m);
+    U factor = exp2f(o_max - new_max);
+    U p_factor = exp2f(m - new_max);
+    o_max = new_max;
+    const float* p = partials + b * Dv + v_per_thread * lane_idx;
+    PRAGMA_LOOP_UNROLL
+    for (int i = 0; i < v_per_thread; i++) {
+      o[i] = o[i] * factor + p[i] * p_factor;
+    }
+  }
+
+  U max_score = Limits<U>::finite_min();
+  U sum_exp_score = 0.f;
+  for (int b = lane_idx; b < blocks; b += BD) {
+    U m = maxs[b];
+    U new_max = max(max_score, m);
+    sum_exp_score = sum_exp_score * exp2f(max_score - new_max) +
+        sums[b] * exp2f(m - new_max);
+    max_score = new_max;
+  }
+  U new_max = cg::reduce(warp, max_score, cg::greater<U>());
+  sum_exp_score = cg::reduce(
+      warp, sum_exp_score * exp2f(max_score - new_max), cg::plus<U>());
+  sum_exp_score = sum_exp_score == 0 ? 0 : __frcp_rn(sum_exp_score);
+
+  // Bring every warp's outputs to the global max.
+  U factor = exp2f(o_max - new_max);
+  PRAGMA_LOOP_UNROLL
+  for (int i = 0; i < v_per_thread; i++) {
+    o[i] *= factor;
   }
 
   // Now we need to aggregate all the outputs
@@ -459,7 +499,7 @@ __global__ void __launch_bounds__(1024) kernel_sdpav_2pass_2(
   for (int i = 0; i < v_per_thread; i++) {
     outputs[lane_idx][warp_idx] = o[i];
     block.sync();
-    U ot = outputs[warp_idx][lane_idx] * factor;
+    U ot = outputs[warp_idx][lane_idx];
     o[i] = cg::reduce(warp, ot, cg::plus<U>()) * sum_exp_score;
     block.sync();
   }
@@ -576,6 +616,22 @@ void sdpa_vector_1pass_fallback(
   });
 }
 
+// Number of key blocks for the 2-pass kernels. 32 blocks per head fill the
+// GPU unless there are only a few heads, so for long contexts keep doubling
+// while the first pass has fewer than two thread blocks per SM. Wider heads
+// count as several heads since each of their blocks does more work.
+int sdpa_vector_2pass_blocks(int num_sms, int heads, int kL, int Dv) {
+  constexpr int keys_per_iter = 8; // BN in kernel_sdpav_2pass_1
+  constexpr int min_keys_per_warp = 64;
+  const int work = heads * std::max(Dv, 256) / 256;
+  int blocks = 32;
+  while (work * blocks < 2 * num_sms &&
+         2 * blocks * keys_per_iter * min_keys_per_warp <= kL) {
+    blocks *= 2;
+  }
+  return blocks;
+}
+
 void sdpa_vector_2pass_fallback(
     const Stream& s,
     cu::CommandEncoder& encoder,
@@ -602,9 +658,13 @@ void sdpa_vector_2pass_fallback(
       /* int64_t V_strides[3] = */ {v.strides(0), v.strides(1), v.strides(2)},
       /* int64_t O_strides[3] = */ {o.strides(0), o.strides(1), o.strides(2)}};
 
-  // Allocate the intermediates
-  int blocks = 32;
+  int blocks = sdpa_vector_2pass_blocks(
+      encoder.device().multi_processor_count(),
+      params.B * params.H * params.qL,
+      params.kL,
+      v.shape(3));
 
+  // Allocate the intermediates
   Shape intermediate_shape;
   intermediate_shape.reserve(o.ndim() + 1);
   intermediate_shape.insert(
@@ -628,65 +688,72 @@ void sdpa_vector_2pass_fallback(
   dispatch_float_types(o.dtype(), "kernel_sdpav_2pass", [&](auto type_tag) {
     dispatch_bool(do_causal, [&](auto do_causal) {
       dispatch_headdims(q.shape(3), v.shape(3), [&](auto dk, auto dv) {
-        using DataType = cuda_type_t<MLX_GET_TYPE(type_tag)>;
+        dispatch_bool(blocks == 32, [&](auto fixed_blocks) {
+          using DataType = cuda_type_t<MLX_GET_TYPE(type_tag)>;
 
-        {
-          auto kernel = cu::kernel_sdpav_2pass_1<
-              DataType,
-              do_causal.value,
-              dk.value,
-              dv.value>;
+          {
+            auto kernel = cu::kernel_sdpav_2pass_1<
+                DataType,
+                do_causal.value,
+                dk.value,
+                dv.value,
+                fixed_blocks.value>;
 
-          encoder.set_input_array(q);
-          encoder.set_input_array(k);
-          encoder.set_input_array(v);
-          if (sinks) {
-            encoder.set_input_array(*sinks);
+            encoder.set_input_array(q);
+            encoder.set_input_array(k);
+            encoder.set_input_array(v);
+            if (sinks) {
+              encoder.set_input_array(*sinks);
+            }
+
+            encoder.set_output_array(intermediate);
+            encoder.set_output_array(sums);
+            encoder.set_output_array(maxs);
+
+            dim3 grid_dim(params.H, params.qL, params.B * blocks);
+            dim3 block_dim(8 * 32, 1, 1);
+
+            encoder.add_kernel_node(
+                kernel,
+                grid_dim,
+                block_dim,
+                gpu_ptr<DataType>(q),
+                gpu_ptr<DataType>(k),
+                gpu_ptr<DataType>(v),
+                sinks ? gpu_ptr<DataType>(*sinks) : nullptr,
+                gpu_ptr<float>(intermediate),
+                gpu_ptr<float>(sums),
+                gpu_ptr<float>(maxs),
+                params);
           }
 
-          encoder.set_output_array(intermediate);
-          encoder.set_output_array(sums);
-          encoder.set_output_array(maxs);
+          {
+            auto kernel = cu::kernel_sdpav_2pass_2<
+                DataType,
+                do_causal.value,
+                dv.value,
+                fixed_blocks.value>;
 
-          dim3 grid_dim(params.H, params.qL, params.B * 32);
-          dim3 block_dim(8 * 32, 1, 1);
+            encoder.set_input_array(intermediate);
+            encoder.set_input_array(sums);
+            encoder.set_input_array(maxs);
+            encoder.set_output_array(o);
 
-          encoder.add_kernel_node(
-              kernel,
-              grid_dim,
-              block_dim,
-              gpu_ptr<DataType>(q),
-              gpu_ptr<DataType>(k),
-              gpu_ptr<DataType>(v),
-              sinks ? gpu_ptr<DataType>(*sinks) : nullptr,
-              gpu_ptr<float>(intermediate),
-              gpu_ptr<float>(sums),
-              gpu_ptr<float>(maxs),
-              params);
-        }
+            dim3 grid_dim(params.H, params.qL, params.B);
+            dim3 block_dim(1024, 1, 1);
 
-        {
-          auto kernel =
-              cu::kernel_sdpav_2pass_2<DataType, do_causal.value, dv.value>;
-
-          encoder.set_input_array(intermediate);
-          encoder.set_input_array(sums);
-          encoder.set_input_array(maxs);
-          encoder.set_output_array(o);
-
-          dim3 grid_dim(params.H, params.qL, params.B);
-          dim3 block_dim(1024, 1, 1);
-
-          encoder.add_kernel_node(
-              kernel,
-              grid_dim,
-              block_dim,
-              gpu_ptr<float>(intermediate),
-              gpu_ptr<float>(sums),
-              gpu_ptr<float>(maxs),
-              gpu_ptr<DataType>(o),
-              params);
-        }
+            encoder.add_kernel_node(
+                kernel,
+                grid_dim,
+                block_dim,
+                gpu_ptr<float>(intermediate),
+                gpu_ptr<float>(sums),
+                gpu_ptr<float>(maxs),
+                gpu_ptr<DataType>(o),
+                params,
+                blocks);
+          }
+        });
       });
     });
   });

@@ -1429,6 +1429,42 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
                         check(Dk, Dv, 1, kL, 8, 2, False, False, dtype)
 
     @unittest.skipIf(not mx.cuda.is_available(), "CUDA kernel path only")
+    def test_sdpa_vector_2pass_many_blocks_cuda(self):
+        # Few heads at long context split the keys into more than 32 blocks
+        # (64 or 128, depending on the GPU).
+        mx.random.seed(0)
+        for D, kL, B, (qH, kH), qL, causal, use_sinks in (
+            (256, 40001, 1, (1, 1), 1, False, False),
+            (256, 70001, 1, (4, 1), 1, False, True),
+            (256, 70001, 2, (1, 1), 3, True, False),
+            (128, 65536, 1, (2, 2), 1, True, True),
+            (512, 70001, 1, (1, 1), 1, False, False),
+        ):
+            with self.subTest(D=D, kL=kL, B=B, heads=(qH, kH), qL=qL):
+                q = mx.random.normal((B, qH, qL, D)).astype(mx.float16)
+                k = mx.random.normal((B, kH, kL, D)).astype(mx.float16)
+                v = mx.random.normal((B, kH, kL, D)).astype(mx.float16)
+                sinks = (
+                    mx.random.normal((qH,)).astype(mx.float16) if use_sinks else None
+                )
+                mask = "causal" if causal else None
+                scale = D**-0.5
+                ref = mlx_ref_attn(
+                    q.astype(mx.float32),
+                    k.astype(mx.float32),
+                    v.astype(mx.float32),
+                    scale=scale,
+                    mask=mask,
+                    sinks=None if sinks is None else sinks.astype(mx.float32),
+                )
+                out = mx.fast.scaled_dot_product_attention(
+                    q, k, v, scale=scale, mask=mask, sinks=sinks, force_fused=True
+                )
+                self.assertTrue(
+                    mx.allclose(ref, out.astype(mx.float32), atol=2e-3, rtol=2e-3)
+                )
+
+    @unittest.skipIf(not mx.cuda.is_available(), "CUDA kernel path only")
     def test_sdpa_vector_kv_layouts_cuda(self):
         if mx.default_device() != mx.gpu:
             self.skipTest("requires GPU")
