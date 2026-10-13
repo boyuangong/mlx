@@ -1465,6 +1465,43 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
                 )
 
     @unittest.skipIf(not mx.cuda.is_available(), "CUDA kernel path only")
+    def test_sdpa_vector_gqa_groups_cuda(self):
+        if mx.default_device() != mx.gpu:
+            self.skipTest("requires GPU")
+        # Long single-query decode packs the query heads of a GQA group into
+        # one warp. Cover group sizes that pack fully (2, 8), partially (6)
+        # or not at all (3), batches and sinks.
+        mx.random.seed(0)
+        for D, (qH, kH), B, kL, use_sinks in product(
+            (128, 256, 512),
+            ((4, 2), (6, 2), (12, 2), (16, 2)),
+            (1, 2),
+            (2048, 5000),
+            (False, True),
+        ):
+            with self.subTest(D=D, heads=(qH, kH), B=B, kL=kL, sinks=use_sinks):
+                q = mx.random.normal((B, qH, 1, D)).astype(mx.float16)
+                k = mx.random.normal((B, kH, kL, D)).astype(mx.float16)
+                v = mx.random.normal((B, kH, kL, D)).astype(mx.float16)
+                sinks = (
+                    mx.random.normal((qH,)).astype(mx.float16) if use_sinks else None
+                )
+                scale = D**-0.5
+                ref = mlx_ref_attn(
+                    q.astype(mx.float32),
+                    k.astype(mx.float32),
+                    v.astype(mx.float32),
+                    scale=scale,
+                    sinks=None if sinks is None else sinks.astype(mx.float32),
+                )
+                out = mx.fast.scaled_dot_product_attention(
+                    q, k, v, scale=scale, sinks=sinks, force_fused=True
+                )
+                self.assertTrue(
+                    mx.allclose(ref, out.astype(mx.float32), atol=2e-3, rtol=2e-3)
+                )
+
+    @unittest.skipIf(not mx.cuda.is_available(), "CUDA kernel path only")
     def test_sdpa_vector_kv_layouts_cuda(self):
         if mx.default_device() != mx.gpu:
             self.skipTest("requires GPU")
