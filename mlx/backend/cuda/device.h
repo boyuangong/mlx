@@ -186,6 +186,9 @@ class MLX_API Device {
   int compute_capability_minor() const {
     return compute_capability_minor_;
   }
+  int multi_processor_count() const {
+    return multi_processor_count_;
+  }
   bool concurrent_managed_access() const {
     return concurrent_managed_access_ == 1;
   }
@@ -203,6 +206,7 @@ class MLX_API Device {
   int device_;
   int compute_capability_major_;
   int compute_capability_minor_;
+  int multi_processor_count_;
   int concurrent_managed_access_;
   int host_native_atomic_;
   int managed_memory_;

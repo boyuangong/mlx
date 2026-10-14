@@ -43,6 +43,8 @@ Device::Device(int device) : device_(device) {
   CHECK_CUDA_ERROR(cudaDeviceGetAttribute(
       &compute_capability_minor_, cudaDevAttrComputeCapabilityMinor, device_));
   CHECK_CUDA_ERROR(cudaDeviceGetAttribute(
+      &multi_processor_count_, cudaDevAttrMultiProcessorCount, device_));
+  CHECK_CUDA_ERROR(cudaDeviceGetAttribute(
       &concurrent_managed_access_,
       cudaDevAttrConcurrentManagedAccess,
       device_));
