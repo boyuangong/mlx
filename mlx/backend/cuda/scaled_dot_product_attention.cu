@@ -9,6 +9,7 @@
 #include "mlx/backend/cuda/kernel_utils.cuh"
 #include "mlx/backend/gpu/copy.h"
 #include "mlx/dtype_utils.h"
+#include "mlx/utils.h"
 
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
@@ -406,6 +407,170 @@ __global__ void __launch_bounds__(256) kernel_sdpav_2pass_1(
   }
 }
 
+// First pass for single-query decode with grouped-query attention. Each
+// warp holds HPT query heads that share a key/value head, so every key and
+// value row is read once for all of them instead of once per query head.
+// The grid runs over (kv head, group of HPT query heads) along x; the
+// partials it writes have the same layout as kernel_sdpav_2pass_1.
+template <typename T, int Dk, int Dv, int HPT, bool fixed_blocks>
+__global__ void __launch_bounds__(256) kernel_sdpav_2pass_1_gqa(
+    const T* Q,
+    const T* K,
+    const T* V,
+    const T* sinks,
+    float* partials,
+    float* sums,
+    float* maxs,
+    __grid_constant__ const AttnParams params) {
+  constexpr int BN = 8;
+  constexpr int BD = 32;
+  const int blocks = fixed_blocks ? 32 : gridDim.z / params.B;
+
+  static_assert(Dk % BD == 0 && Dv % BD == 0);
+  constexpr int qk_per_thread = Dk / BD;
+  constexpr int v_per_thread = Dv / BD;
+
+  const int inner_k_stride = blocks * BN * int(params.K_strides[2]);
+  const int inner_v_stride = blocks * BN * int(params.V_strides[2]);
+
+  typedef float U;
+
+  U q[HPT][qk_per_thread];
+  U o[HPT][v_per_thread];
+  U max_score[HPT];
+  U sum_exp_score[HPT];
+
+  __shared__ U outputs[BN][BD + 1];
+  __shared__ U max_scores[BN];
+  __shared__ U sum_exp_scores[BN];
+
+  const U scale_log2 = params.scale * 1.44269504089f;
+
+  auto block = cg::this_thread_block();
+  auto warp = cg::tiled_partition<32>(block);
+
+  const int lane_idx = warp.thread_rank();
+  const int warp_idx = warp.meta_group_rank();
+
+  const int groups_per_kv_head = params.gqa_factor / HPT;
+  const int batch_idx = blockIdx.z / blocks;
+  const int block_idx = blockIdx.z % blocks;
+  const int kv_head_idx = blockIdx.x / groups_per_kv_head;
+  const int head0 =
+      kv_head_idx * params.gqa_factor + (blockIdx.x % groups_per_kv_head) * HPT;
+  const int kv_seq_idx = block_idx * BN + warp_idx;
+
+  K += batch_idx * params.K_strides[0] + // Batch
+      kv_head_idx * params.K_strides[1] + // Head
+      kv_seq_idx * params.K_strides[2]; // Sequence
+
+  V += batch_idx * params.V_strides[0] + // Batch
+      kv_head_idx * params.V_strides[1] + // Head
+      kv_seq_idx * params.V_strides[2]; // Sequence
+
+  // Read the queries and 0 the output accumulators
+  PRAGMA_LOOP_UNROLL
+  for (int h = 0; h < HPT; h++) {
+    const T* q_ptr =
+        Q + batch_idx * params.Q_strides[0] + (head0 + h) * params.Q_strides[1];
+    PRAGMA_LOOP_UNROLL
+    for (int i = 0; i < qk_per_thread; i++) {
+      q[h][i] =
+          scale_log2 * static_cast<U>(q_ptr[qk_per_thread * lane_idx + i]);
+    }
+    PRAGMA_LOOP_UNROLL
+    for (int i = 0; i < v_per_thread; i++) {
+      o[h][i] = 0.f;
+    }
+    max_score[h] = Limits<U>::finite_min();
+    sum_exp_score[h] = 0.f;
+    if (sinks && warp_idx == 0 && block_idx == 0) {
+      max_score[h] = M_LOG2E * static_cast<U>(sinks[head0 + h]);
+      sum_exp_score[h] = 1.f;
+    }
+  }
+
+  const bool k_vec = vector_rows<qk_per_thread>(K, params.K_strides[2]);
+  const bool v_vec = vector_rows<v_per_thread>(V, params.V_strides[2]);
+
+  // With a single query every key is visible, causal or not.
+  for (int i = kv_seq_idx; i < params.kL; i += blocks * BN) {
+    U k[qk_per_thread];
+    for_each_lane_value<qk_per_thread>(
+        K, lane_idx, k_vec, [&](int j, T x) { k[j] = static_cast<U>(x); });
+
+    U exp_score[HPT];
+    U factor[HPT];
+    PRAGMA_LOOP_UNROLL
+    for (int h = 0; h < HPT; h++) {
+      U score = 0.f;
+      PRAGMA_LOOP_UNROLL
+      for (int j = 0; j < qk_per_thread; j++) {
+        score += q[h][j] * k[j];
+      }
+      score = cg::reduce(warp, score, cg::plus<U>());
+      U new_max = max(max_score[h], score);
+      factor[h] = exp2f(max_score[h] - new_max);
+      exp_score[h] = exp2f(score - new_max);
+      max_score[h] = new_max;
+      sum_exp_score[h] = sum_exp_score[h] * factor[h] + exp_score[h];
+    }
+
+    for_each_lane_value<v_per_thread>(V, lane_idx, v_vec, [&](int j, T x) {
+      U vx = static_cast<U>(x);
+      PRAGMA_LOOP_UNROLL
+      for (int h = 0; h < HPT; h++) {
+        o[h][j] = o[h][j] * factor[h] + exp_score[h] * vx;
+      }
+    });
+
+    K += inner_k_stride;
+    V += inner_v_stride;
+  }
+
+  // Combine the warps of the block, one query head at a time.
+  const int p_stride_s = blocks;
+  const int p_stride_h = params.qL * p_stride_s;
+  const int p_stride_b = params.H * p_stride_h;
+  PRAGMA_LOOP_UNROLL
+  for (int h = 0; h < HPT; h++) {
+    const int p_offset =
+        batch_idx * p_stride_b + (head0 + h) * p_stride_h + block_idx;
+
+    if (lane_idx == 0) {
+      max_scores[warp_idx] = max_score[h];
+      sum_exp_scores[warp_idx] = sum_exp_score[h];
+    }
+    block.sync();
+
+    U m = (lane_idx < BN) ? max_scores[lane_idx] : -1e9;
+    U new_max = cg::reduce(warp, m, cg::greater<U>());
+    U f = exp2f(m - new_max);
+    U s = (lane_idx < BN) ? sum_exp_scores[lane_idx] : 0.f;
+    s = cg::reduce(warp, s * f, cg::plus<U>());
+    if (warp_idx == 0 && lane_idx == 0) {
+      sums[p_offset] = s;
+      maxs[p_offset] = new_max;
+    }
+
+    auto ff = exp2f(max_scores[warp_idx] - new_max);
+    PRAGMA_LOOP_UNROLL
+    for (int i = 0; i < v_per_thread; i++) {
+      outputs[warp_idx][lane_idx] = o[h][i] * ff;
+      block.sync();
+      if (warp_idx == 0) {
+        U ot = outputs[0][lane_idx];
+        PRAGMA_LOOP_UNROLL
+        for (int j = 1; j < BN; j++) {
+          ot += outputs[j][lane_idx];
+        }
+        partials[p_offset * Dv + v_per_thread * lane_idx + i] = ot;
+      }
+      block.sync();
+    }
+  }
+}
+
 template <typename T, bool do_causal, int Dv, bool fixed_blocks>
 __global__ void __launch_bounds__(1024) kernel_sdpav_2pass_2(
     const float* partials,
@@ -616,6 +781,36 @@ void sdpa_vector_1pass_fallback(
   });
 }
 
+// Query heads each warp of kernel_sdpav_2pass_1_gqa holds: as many as keep
+// the per-lane query and output accumulators within 64 floats, up to 8.
+constexpr int sdpa_vector_gqa_max_heads(int dk, int dv) {
+  int budget = 64 / ((dk + dv) / 32);
+  int h = 1;
+  while (2 * h <= budget && 2 * h <= 8) {
+    h *= 2;
+  }
+  return h;
+}
+
+// Heads per warp for the GQA first pass, or 0 to use the per-head kernel:
+// single-query decode only, with a power-of-two group that divides the GQA
+// factor, of at least 4 heads. Pairs of heads stay on the per-head kernel:
+// whether sharing a row between two heads pays off depends on the GPU (it
+// helped on an A10G at D = 512 and hurt at D = 256, and the reverse on an
+// H100), while groups of 4 or more won on both. MLX_CUDA_SDPA_GQA_PACK=0
+// disables packing; a larger value raises the smallest packed group.
+int sdpa_vector_gqa_heads(int qL, int gqa_factor, int dk, int dv) {
+  static int min_heads = env::get_var("MLX_CUDA_SDPA_GQA_PACK", 4);
+  if (min_heads <= 0 || qL != 1) {
+    return 0;
+  }
+  int h = sdpa_vector_gqa_max_heads(dk, dv);
+  while (h >= 2 && gqa_factor % h != 0) {
+    h /= 2;
+  }
+  return h >= std::max(min_heads, 4) ? h : 0;
+}
+
 // Number of key blocks for the 2-pass kernels. 32 blocks per head fill the
 // GPU unless there are only a few heads, so for long contexts keep doubling
 // while the first pass has fewer than two thread blocks per SM. Wider heads
@@ -658,9 +853,12 @@ void sdpa_vector_2pass_fallback(
       /* int64_t V_strides[3] = */ {v.strides(0), v.strides(1), v.strides(2)},
       /* int64_t O_strides[3] = */ {o.strides(0), o.strides(1), o.strides(2)}};
 
+  const int gqa_heads = sdpa_vector_gqa_heads(
+      params.qL, params.gqa_factor, q.shape(3), v.shape(3));
+  // A thread block of the GQA first pass covers gqa_heads query heads.
   int blocks = sdpa_vector_2pass_blocks(
       encoder.device().multi_processor_count(),
-      params.B * params.H * params.qL,
+      params.B * params.H * params.qL / std::max(gqa_heads, 1),
       params.kL,
       v.shape(3));
 
@@ -692,13 +890,6 @@ void sdpa_vector_2pass_fallback(
           using DataType = cuda_type_t<MLX_GET_TYPE(type_tag)>;
 
           {
-            auto kernel = cu::kernel_sdpav_2pass_1<
-                DataType,
-                do_causal.value,
-                dk.value,
-                dv.value,
-                fixed_blocks.value>;
-
             encoder.set_input_array(q);
             encoder.set_input_array(k);
             encoder.set_input_array(v);
@@ -710,21 +901,58 @@ void sdpa_vector_2pass_fallback(
             encoder.set_output_array(sums);
             encoder.set_output_array(maxs);
 
-            dim3 grid_dim(params.H, params.qL, params.B * blocks);
             dim3 block_dim(8 * 32, 1, 1);
+            auto launch = [&](auto kernel, dim3 grid_dim) {
+              encoder.add_kernel_node(
+                  kernel,
+                  grid_dim,
+                  block_dim,
+                  gpu_ptr<DataType>(q),
+                  gpu_ptr<DataType>(k),
+                  gpu_ptr<DataType>(v),
+                  sinks ? gpu_ptr<DataType>(*sinks) : nullptr,
+                  gpu_ptr<float>(intermediate),
+                  gpu_ptr<float>(sums),
+                  gpu_ptr<float>(maxs),
+                  params);
+            };
 
-            encoder.add_kernel_node(
-                kernel,
-                grid_dim,
-                block_dim,
-                gpu_ptr<DataType>(q),
-                gpu_ptr<DataType>(k),
-                gpu_ptr<DataType>(v),
-                sinks ? gpu_ptr<DataType>(*sinks) : nullptr,
-                gpu_ptr<float>(intermediate),
-                gpu_ptr<float>(sums),
-                gpu_ptr<float>(maxs),
-                params);
+            constexpr int max_heads =
+                sdpa_vector_gqa_max_heads(dk.value, dv.value);
+            dim3 gqa_grid(
+                params.H / std::max(gqa_heads, 1), 1, params.B * blocks);
+            auto launch_gqa = [&](auto hpt) {
+              if constexpr (hpt.value <= max_heads) {
+                launch(
+                    cu::kernel_sdpav_2pass_1_gqa<
+                        DataType,
+                        dk.value,
+                        dv.value,
+                        hpt.value,
+                        fixed_blocks.value>,
+                    gqa_grid);
+              } else {
+                throw std::runtime_error(
+                    "[sdpa_vector] Too many GQA heads per warp.");
+              }
+            };
+            switch (gqa_heads) {
+              case 4:
+                launch_gqa(std::integral_constant<int, 4>{});
+                break;
+              case 8:
+                launch_gqa(std::integral_constant<int, 8>{});
+                break;
+              default:
+                launch(
+                    cu::kernel_sdpav_2pass_1<
+                        DataType,
+                        do_causal.value,
+                        dk.value,
+                        dv.value,
+                        fixed_blocks.value>,
+                    dim3(params.H, params.qL, params.B * blocks));
+            }
           }
 
           {
